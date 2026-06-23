@@ -1,0 +1,133 @@
+name: Deploy to Cloud
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  CLUSTER_NAME: digitrans-cm-cluster
+
+jobs:
+  deploy-kubernetes:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Cloud SDK (GCP example)
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Configure kubectl
+      run: |
+        gcloud container clusters get-credentials ${{ env.CLUSTER_NAME }} \
+          --zone ${{ secrets.GCP_ZONE }} \
+          --project ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Build and push Docker images
+      run: |
+        docker login -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }} ${{ env.REGISTRY }}
+        
+        for service in api-gateway erp-service crm-service supply-chain-service; do
+          docker build -f $service/Dockerfile -t ${{ env.REGISTRY }}/${{ github.repository }}/$service:${{ github.sha }} .
+          docker push ${{ env.REGISTRY }}/${{ github.repository }}/$service:${{ github.sha }}
+        done
+
+    - name: Update Kubernetes manifests
+      run: |
+        # Update image tags in k8s manifests
+        for manifest in k8s/deployments/*.yml; do
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g" $manifest
+          sed -i "s|REGISTRY|${{ env.REGISTRY }}/${{ github.repository }}|g" $manifest
+        done
+
+    - name: Apply Kubernetes manifests
+      run: |
+        kubectl apply -f k8s/namespaces/
+        kubectl apply -f k8s/secrets/
+        kubectl apply -f k8s/configmaps/
+        kubectl apply -f k8s/services/
+        kubectl apply -f k8s/deployments/
+
+    - name: Wait for rollout
+      run: |
+        for deployment in api-gateway erp-service crm-service supply-chain-service; do
+          kubectl rollout status deployment/$deployment -n digitrans --timeout=5m
+        done
+
+    - name: Run smoke tests
+      run: |
+        kubectl port-forward -n digitrans svc/api-gateway 8080:8080 &
+        sleep 5
+        curl -X POST http://localhost:8080/api/auth/login \
+          -d "username=admin&password=admin" \
+          -H "Content-Type: application/x-www-form-urlencoded"
+
+    - name: Create rollback point
+      if: failure()
+      run: |
+        kubectl rollout undo deployment/api-gateway -n digitrans
+        kubectl rollout undo deployment/erp-service -n digitrans
+        kubectl rollout undo deployment/crm-service -n digitrans
+        kubectl rollout undo deployment/supply-chain-service -n digitrans
+
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          Deployment to ${{ github.event.inputs.environment || 'production' }} ${{ job.status }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
+
+  health-check:
+    needs: deploy-kubernetes
+    runs-on: ubuntu-latest
+    if: success()
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Configure kubectl
+      run: |
+        gcloud container clusters get-credentials ${{ env.CLUSTER_NAME }} \
+          --zone ${{ secrets.GCP_ZONE }} \
+          --project ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Verify all services are healthy
+      run: |
+        for service in api-gateway erp-service crm-service supply-chain-service; do
+          echo "Checking $service..."
+          kubectl get pods -n digitrans -l app=$service
+          kubectl logs -n digitrans -l app=$service --tail=20
+        done
+
+    - name: Check Prometheus metrics
+      run: |
+        kubectl port-forward -n monitoring svc/prometheus 9090:9090 &
+        sleep 5
+        curl http://localhost:9090/api/v1/query?query=up

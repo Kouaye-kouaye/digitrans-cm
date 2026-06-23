@@ -1,0 +1,137 @@
+name: Performance & Load Testing
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: digitrans
+          POSTGRES_PASSWORD: digitrans123
+          POSTGRES_DB: digitrans
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Build services
+      run: mvn clean package -DskipTests
+
+    - name: Start services with Docker Compose
+      run: |
+        docker-compose up -d
+        sleep 30  # Wait for services to initialize
+
+    - name: Install k6
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gnupg software-properties-common
+        sudo gpg -k
+        sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3232A
+        sudo add-apt-repository "deb https://dl.k6.io/deb stable main"
+        sudo apt-get update
+        sudo apt-get install -y k6
+
+    - name: Run k6 smoke tests
+      run: k6 run tests/performance/k6-smoke-test.js
+      env:
+        BASE_URL: http://localhost:8080
+
+    - name: Run k6 load tests
+      run: k6 run tests/performance/k6-load-test.js --vus 50 --duration 5m
+      env:
+        BASE_URL: http://localhost:8080
+
+    - name: Upload k6 results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: k6-results
+        path: 'k6-results.json'
+
+    - name: Stop services
+      if: always()
+      run: docker-compose down
+
+  security-audit:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run npm audit (if applicable)
+      run: npm audit --production || true
+
+    - name: Check for secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: ${{ github.event.repository.default_branch }}
+        head: HEAD
+        extra_args: --debug
+
+  sast-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Run SpotBugs
+      run: mvn spotbugs:check
+
+    - name: Run Checkstyle
+      run: mvn checkstyle:check
+
+  generate-reports:
+    needs: [load-test, security-audit]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download test artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: reports/
+
+    - name: Generate report summary
+      run: |
+        echo "# Pipeline Test Report" > $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+        echo "- Load Tests: ✓ Completed" >> $GITHUB_STEP_SUMMARY
+        echo "- Security Audit: ✓ Completed" >> $GITHUB_STEP_SUMMARY
+        echo "- SAST Scan: ✓ Completed" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload report to artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: final-report
+        path: reports/

@@ -1,0 +1,274 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: digitrans
+          POSTGRES_PASSWORD: digitrans123
+          POSTGRES_DB: digitrans
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Build with Maven
+      run: mvn clean package -DskipTests
+
+    - name: Run Unit Tests
+      run: mvn test
+
+    - name: SonarCloud Scan (optional)
+      uses: SonarSource/sonarcloud-github-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: '**/target/surefire-reports'
+
+  docker-build:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        service: [api-gateway, erp-service, crm-service, supply-chain-service]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./${{ matrix.service }}/Dockerfile
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Run OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'digitrans-cm'
+        path: '.'
+        format: 'JSON'
+
+  integration-tests:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: digitrans
+          POSTGRES_PASSWORD: digitrans123
+          POSTGRES_DB: digitrans
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Run integration tests
+      run: mvn verify -Dgroups=integration
+      env:
+        SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/digitrans
+        SPRING_DATASOURCE_USERNAME: digitrans
+        SPRING_DATASOURCE_PASSWORD: digitrans123
+
+  e2e-tests:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install Playwright browsers
+      run: npx playwright install --with-deps
+
+    - name: Start Docker Compose stack
+      run: docker-compose up -d
+
+    - name: Wait for services to be ready
+      run: |
+        npm install axios
+        node -e "
+        const axios = require('axios');
+        const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        const check = async () => {
+          for (let i = 0; i < 30; i++) {
+            try {
+              const res = await axios.get('http://localhost:8080/actuator/health');
+              if (res.status === 200) {
+                console.log('Services are ready!');
+                return;
+              }
+            } catch (e) {
+              console.log('Waiting for services...');
+              await wait(2000);
+            }
+          }
+          throw new Error('Services did not start in time');
+        };
+        check();
+        "
+
+    - name: Run Playwright tests
+      run: npx playwright test
+
+    - name: Upload Playwright report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: playwright-report
+        path: playwright-report/
+
+    - name: Stop Docker Compose stack
+      if: always()
+      run: docker-compose down
+
+  deploy-staging:
+    needs: [build, integration-tests, e2e-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.digitrans-cm.example.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Deploy to Staging
+      env:
+        DEPLOY_KEY: ${{ secrets.STAGING_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.STAGING_HOST }}
+      run: |
+        echo "Deploying to staging environment..."
+        # Example: ssh deployment script
+        # ssh -i $DEPLOY_KEY user@$DEPLOY_HOST './deploy.sh staging'
+
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests on staging..."
+        # npm run test:smoke
+
+  deploy-production:
+    needs: [build, integration-tests, e2e-tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && startsWith(github.ref, 'refs/tags/')
+    environment:
+      name: production
+      url: https://digitrans-cm.example.com
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Deploy to Production
+      env:
+        DEPLOY_KEY: ${{ secrets.PROD_DEPLOY_KEY }}
+        DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+      run: |
+        echo "Deploying to production environment..."
+        # ssh -i $DEPLOY_KEY user@$DEPLOY_HOST './deploy.sh production'
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: 'Production deployment completed'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
