@@ -1,0 +1,77 @@
+image: maven:3.9-eclipse-temurin-21
+
+services:
+  - docker:dind
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+
+stages:
+  - build
+  - test
+  - package
+  - publish
+
+cache:
+  key: $CI_COMMIT_REF_SLUG
+  paths:
+    - .m2/repository
+
+build:
+  stage: build
+  script:
+    - mvn compile -q
+  artifacts:
+    paths:
+      - api-gateway/target
+      - erp-service/target
+      - crm-service/target
+      - supply-chain-service/target
+    expire_in: 1h
+
+test:
+  stage: test
+  script:
+    - mvn test -pl erp-service,crm-service,supply-chain-service
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - "**/target/surefire-reports/TEST-*.xml"
+    expire_in: 1w
+
+package:
+  stage: package
+  script:
+    - mvn package -DskipTests -q
+  artifacts:
+    paths:
+      - api-gateway/target/*.jar
+      - erp-service/target/*.jar
+      - crm-service/target/*.jar
+      - supply-chain-service/target/*.jar
+    expire_in: 1h
+
+publish:
+  stage: publish
+  image: docker:27
+  services:
+    - docker:dind
+  before_script:
+    - echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USERNAME" --password-stdin
+  script:
+    - |
+      TAG="$CI_COMMIT_SHORT_SHA"
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        EXTRA_TAG="latest"
+      else
+        EXTRA_TAG="$CI_COMMIT_REF_SLUG"
+      fi
+      for service in api-gateway erp-service crm-service supply-chain-service; do
+        echo "Building $service..."
+        docker build -f $service/Dockerfile -t $DOCKER_USERNAME/digitrans-$service:$TAG -t $DOCKER_USERNAME/digitrans-$service:$EXTRA_TAG .
+        docker push $DOCKER_USERNAME/digitrans-$service:$TAG
+        docker push $DOCKER_USERNAME/digitrans-$service:$EXTRA_TAG
+      done

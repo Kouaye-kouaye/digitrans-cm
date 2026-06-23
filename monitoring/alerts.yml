@@ -1,0 +1,50 @@
+groups:
+  - name: digitrans-alerts
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} is down"
+
+      - alert: HighLatencyP95
+        expr: histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket[5m])) by (le, service)) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 latency > 1s on {{ $labels.service }}"
+
+      - alert: HighErrorRate
+        expr: rate(http_server_requests_seconds_count{status=~"5.."}[5m]) / rate(http_server_requests_seconds_count[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error rate > 1% on {{ $labels.service }}"
+
+      - alert: HighMemoryUsage
+        expr: jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"} > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory > 80% on {{ $labels.service }}"
+
+      - alert: HighCpuLoad
+        expr: jvm_cpu_load > 0.7
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU > 70% on {{ $labels.service }}"
+
+      - alert: DatabaseConnectionsExhausted
+        expr: hikaricp_connections_active / hikaricp_connections_max > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "> 80% DB connections used on {{ $labels.service }}"
